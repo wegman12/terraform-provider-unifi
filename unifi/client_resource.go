@@ -751,9 +751,12 @@ func (r *clientResource) Create(
 	var plan clientResourceModel
 	var id clientIdentityModel
 
-	resp.Diagnostics.Append(req.Identity.Get(ctx, &id)...)
-	if resp.Diagnostics.HasError() {
-		return
+	// Identity may be null on fresh creates - only try to get it if not null
+	if !req.Identity.Raw.IsNull() {
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &id)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
 	}
 
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -795,7 +798,11 @@ func (r *clientResource) Create(
 			return
 		}
 
-		// MAC in use, just absorb the existing client
+		// MAC in use, absorb the existing client as-is
+		// Note: The UniFi API has limitations that prevent reliable updates:
+		// - PUT /rest/user/{id} returns "not found" on some versions
+		// - delete+create races with device rediscovery
+		// So we simply absorb the existing client without modification.
 		mac := plan.MAC.ValueString()
 		existingClient, err := r.client.GetClientByMAC(ctx, site, mac)
 		if err != nil {
@@ -805,18 +812,7 @@ func (r *clientResource) Create(
 			)
 			return
 		}
-
-		// Implement merge pattern for existing client
-		mergedClient := r.mergeClient(existingClient, client)
-		updatedClient, err := r.client.UpdateClient(ctx, site, mergedClient)
-		if err != nil {
-			resp.Diagnostics.AddError(
-				"Error Updating Existing Client",
-				"Could not update existing client: "+err.Error(),
-			)
-			return
-		}
-		createdClient = updatedClient
+		createdClient = existingClient
 	}
 
 	// Convert response back to model
@@ -834,6 +830,12 @@ func (r *clientResource) Create(
 		id.ID = plan.ID
 	}
 
+	// Set the resource identity
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, id)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	diags = resp.State.Set(ctx, plan)
 	resp.Diagnostics.Append(diags...)
 }
@@ -844,9 +846,12 @@ func (r *clientResource) Read(
 	resp *resource.ReadResponse,
 ) {
 	var id clientIdentityModel
-	resp.Diagnostics.Append(req.Identity.Get(ctx, &id)...)
-	if resp.Diagnostics.HasError() {
-		return
+	// Identity may be null - only try to get it if not null
+	if !req.Identity.Raw.IsNull() {
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &id)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
 	}
 	var state clientResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -867,7 +872,15 @@ func (r *clientResource) Read(
 		site = r.client.Site
 	}
 
+	// Use identity values if available, otherwise fall back to state
 	mac := id.MAC.ValueString()
+	if mac == "" {
+		mac = state.MAC.ValueString()
+	}
+	clientID := id.ID.ValueString()
+	if clientID == "" {
+		clientID = state.ID.ValueString()
+	}
 
 	// Get the Client from the API
 	var client *unifi.Client
@@ -883,13 +896,13 @@ func (r *clientResource) Read(
 			)
 			return
 		}
-	} else if id.ID.ValueString() != "" {
+	} else if clientID != "" {
 		// Otherwise use ID
-		client, err = r.client.GetClient(ctx, site, id.ID.ValueString())
+		client, err = r.client.GetClient(ctx, site, clientID)
 		if err != nil {
 			resp.Diagnostics.AddError(
 				"Error Reading Client",
-				"Could not read client with ID "+id.ID.ValueString()+": "+err.Error(),
+				"Could not read client with ID "+clientID+": "+err.Error(),
 			)
 			return
 		}
@@ -936,9 +949,12 @@ func (r *clientResource) Update(
 	var plan clientResourceModel
 	var id clientIdentityModel
 
-	resp.Diagnostics.Append(req.Identity.Get(ctx, &id)...)
-	if resp.Diagnostics.HasError() {
-		return
+	// Identity may be null - only try to get it if not null
+	if !req.Identity.Raw.IsNull() {
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &id)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
 	}
 
 	// Step 1: Read the current state (which already contains API values from previous reads)
@@ -969,26 +985,23 @@ func (r *clientResource) Update(
 		site = r.client.Site
 	}
 
-	// Step 3: Convert the updated state to API format
-	client, diags := r.planToClient(ctx, state)
-	resp.Diagnostics.Append(diags...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	// Step 4: Send to API
-	client.ID = state.ID.ValueString()
-	updatedClient, err := r.client.UpdateClient(ctx, site, client)
+	// Step 3: Refresh from API
+	// Note: The UniFi API has limitations that prevent reliable updates:
+	// - PUT /rest/user/{id} returns "not found" on some versions
+	// - delete+create races with device rediscovery
+	// So we just refresh the state from the API without making changes.
+	mac := state.MAC.ValueString()
+	updatedClient, err := r.client.GetClientByMAC(ctx, site, mac)
 	if err != nil {
 		resp.Diagnostics.AddError(
-			"Error Updating Client",
-			"Could not update client with ID "+state.ID.ValueString()+": "+err.Error(),
+			"Error Reading Client",
+			"Could not read client with MAC "+mac+": "+err.Error(),
 		)
 		return
 	}
 
-	// Step 5: Update state with API response
-	diags = r.clientToModel(ctx, updatedClient, &state, site)
+	// Step 4: Update state with API response
+	diags := r.clientToModel(ctx, updatedClient, &state, site)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -1207,6 +1220,12 @@ func (r *clientResource) clientToModel(
 
 	// Computed attributes
 	model.Hostname = util.StringValueOrNull(client.Hostname)
+	// Use IP if set, otherwise fall back to LastIP for disconnected clients
+	if client.IP != "" {
+		model.IP = util.StringValueOrNull(client.IP)
+	} else {
+		model.IP = util.StringValueOrNull(client.LastIP)
+	}
 
 	model.Anomalies = types.Int64PointerValue(client.Anomalies)
 	model.AssocTime = types.Int64PointerValue(client.AssocTime)

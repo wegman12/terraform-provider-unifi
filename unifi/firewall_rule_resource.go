@@ -24,6 +24,17 @@ var (
 	_ resource.ResourceWithImportState = &firewallRuleResource{}
 )
 
+// preserveNullBool preserves null state for optional boolean fields when API returns default (false)
+func preserveNullBool(current types.Bool, apiValue bool) types.Bool {
+	if apiValue {
+		return types.BoolValue(true)
+	}
+	if current.IsNull() {
+		return types.BoolNull()
+	}
+	return types.BoolValue(false)
+}
+
 func NewFirewallRuleResource() resource.Resource {
 	return &firewallRuleResource{}
 }
@@ -124,12 +135,12 @@ func (r *firewallRuleResource) Schema(
 				},
 			},
 			"rule_index": schema.Int64Attribute{
-				MarkdownDescription: "The index of the rule. Must be >= 2000 < 3000 or >= 4000 < 5000.",
+				MarkdownDescription: "The index of the rule. Must be >= 20000 < 30000 or >= 40000 < 50000.",
 				Required:            true,
 				Validators: []validator.Int64{
 					int64validator.Any(
-						int64validator.Between(2000, 2999),
-						int64validator.Between(4000, 4999),
+						int64validator.Between(20000, 29999),
+						int64validator.Between(40000, 49999),
 					),
 				},
 			},
@@ -735,11 +746,11 @@ func (r *firewallRuleResource) firewallRuleToModel(
 		model.DstPort = types.StringNull()
 	}
 
-	model.Logging = types.BoolValue(firewallRule.Logging)
-	model.StateEstablished = types.BoolValue(firewallRule.StateEstablished)
-	model.StateInvalid = types.BoolValue(firewallRule.StateInvalid)
-	model.StateNew = types.BoolValue(firewallRule.StateNew)
-	model.StateRelated = types.BoolValue(firewallRule.StateRelated)
+	model.Logging = preserveNullBool(model.Logging, firewallRule.Logging)
+	model.StateEstablished = preserveNullBool(model.StateEstablished, firewallRule.StateEstablished)
+	model.StateInvalid = preserveNullBool(model.StateInvalid, firewallRule.StateInvalid)
+	model.StateNew = preserveNullBool(model.StateNew, firewallRule.StateNew)
+	model.StateRelated = preserveNullBool(model.StateRelated, firewallRule.StateRelated)
 
 	if firewallRule.IPSec != "" {
 		model.IPSec = types.StringValue(firewallRule.IPSec)

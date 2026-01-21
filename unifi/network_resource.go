@@ -47,6 +47,7 @@ type networkResourceModel struct {
 	Name         types.String `tfsdk:"name"`
 	Purpose      types.String `tfsdk:"purpose"`
 	VlanID       types.Int64  `tfsdk:"vlan_id"`
+	VlanEnabled  types.Bool   `tfsdk:"vlan_enabled"`
 	Subnet       types.String `tfsdk:"subnet"`
 	NetworkGroup types.String `tfsdk:"network_group"`
 
@@ -164,6 +165,11 @@ func (r *networkResource) Schema(
 				Validators: []validator.Int64{
 					int64validator.Between(0, 4096),
 				},
+			},
+			"vlan_enabled": schema.BoolAttribute{
+				MarkdownDescription: "Enables VLAN for this network. Must be set to `true` when creating VLANs with `vlan_id`.",
+				Optional:            true,
+				Computed:            true,
 			},
 			"subnet": schema.StringAttribute{
 				MarkdownDescription: "The subnet of the network. Must be a valid CIDR address.",
@@ -679,6 +685,9 @@ func (r *networkResource) applyPlanToState(
 	if !plan.VlanID.IsNull() && !plan.VlanID.IsUnknown() {
 		state.VlanID = plan.VlanID
 	}
+	if !plan.VlanEnabled.IsNull() && !plan.VlanEnabled.IsUnknown() {
+		state.VlanEnabled = plan.VlanEnabled
+	}
 	if !plan.Subnet.IsNull() && !plan.Subnet.IsUnknown() {
 		state.Subnet = plan.Subnet
 	}
@@ -911,6 +920,13 @@ func (r *networkResource) modelToNetwork(
 		network.VLAN = model.VlanID.ValueInt64()
 	}
 
+	if !model.VlanEnabled.IsNull() {
+		network.VLANEnabled = model.VlanEnabled.ValueBool()
+	} else if !model.VlanID.IsNull() && model.VlanID.ValueInt64() > 0 {
+		// Auto-enable VLAN when vlan_id is set
+		network.VLANEnabled = true
+	}
+
 	if !model.Subnet.IsNull() {
 		network.IPSubnet = model.Subnet.ValueString()
 	}
@@ -996,6 +1012,8 @@ func (r *networkResource) networkToModel(
 		model.VlanID = types.Int64Null()
 	}
 
+	model.VlanEnabled = types.BoolValue(network.VLANEnabled)
+
 	if network.IPSubnet != "" {
 		model.Subnet = types.StringValue(network.IPSubnet)
 	} else {
@@ -1049,7 +1067,7 @@ func (r *networkResource) networkToModel(
 		model.DhcpDNS = types.ListNull(types.StringType)
 	}
 
-	model.DhcpdBootEnabled = types.BoolValue(network.DHCPDBootEnabled)
+	model.DhcpdBootEnabled = preserveNullBool(model.DhcpdBootEnabled, network.DHCPDBootEnabled)
 
 	if network.DHCPDBootServer != "" {
 		model.DhcpdBootServer = types.StringValue(network.DHCPDBootServer)
@@ -1063,7 +1081,7 @@ func (r *networkResource) networkToModel(
 		model.DhcpdBootFilename = types.StringNull()
 	}
 
-	model.DhcpRelayEnabled = types.BoolValue(network.DHCPRelayEnabled)
+	model.DhcpRelayEnabled = preserveNullBool(model.DhcpRelayEnabled, network.DHCPRelayEnabled)
 
 	// TODO: Add more field mappings for DHCPv6, IPv6, WAN, WireGuard settings
 	// For now, set remaining fields to null to prevent issues

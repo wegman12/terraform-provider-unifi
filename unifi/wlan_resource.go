@@ -467,6 +467,34 @@ func (r *wlanFrameworkResource) Create(
 		return
 	}
 
+	// Look up and set the default WLAN group ID if not already set
+	if wlan.WLANGroupID == "" {
+		wlanGroups, err := r.client.ListWLANGroup(ctx, site)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Error Listing WLAN Groups",
+				"Could not list WLAN groups: "+err.Error(),
+			)
+			return
+		}
+		// Find the "Default" WLAN group
+		for _, group := range wlanGroups {
+			if group.Name == "Default" {
+				wlan.WLANGroupID = group.ID
+				break
+			}
+		}
+		// If no "Default" found, use the first non-hidden group
+		if wlan.WLANGroupID == "" && len(wlanGroups) > 0 {
+			for _, group := range wlanGroups {
+				if !group.Hidden {
+					wlan.WLANGroupID = group.ID
+					break
+				}
+			}
+		}
+	}
+
 	// Create the WLAN
 	createdWLAN, err := r.client.CreateWLAN(ctx, site, wlan)
 	if err != nil {

@@ -864,7 +864,7 @@ func (r *wanResource) modelToNetwork(
 
 	// Additional Settings
 	network.ReportWANEvent = model.ReportWANEvent.ValueBool()
-	network.Enabled = model.Enabled.ValueBool()
+	network.Enabled = model.Enabled.ValueBoolPointer()
 
 	// Convert DHCP options list
 	if !model.DHCPOptions.IsNull() && !model.DHCPOptions.IsUnknown() {
@@ -1058,7 +1058,11 @@ func (r *wanResource) networkToModel(
 
 	// Additional Settings
 	model.ReportWANEvent = types.BoolValue(network.ReportWANEvent)
-	model.Enabled = types.BoolValue(network.Enabled)
+	if network.Enabled != nil {
+		model.Enabled = types.BoolValue(*network.Enabled)
+	} else {
+		model.Enabled = types.BoolNull()
+	}
 
 	// Convert DHCP options to list
 	if len(network.WANDHCPOptions) > 0 {
