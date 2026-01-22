@@ -16,6 +16,8 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
@@ -218,10 +220,12 @@ func (r *wlanFrameworkResource) Schema(
 				},
 			},
 			"wlan_band": schema.StringAttribute{
-				MarkdownDescription: "WLAN band.",
+				MarkdownDescription: "WLAN band. If not specified, the API default is used.",
 				Optional:            true,
 				Computed:            true,
-				Default:             stringdefault.StaticString("both"),
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 				Validators: []validator.String{
 					stringvalidator.OneOf("2g", "5g", "both"),
 				},
@@ -249,6 +253,9 @@ func (r *wlanFrameworkResource) Schema(
 				MarkdownDescription: "MAC address filtering configuration.",
 				Optional:            true,
 				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
 				Attributes: map[string]schema.Attribute{
 					"enabled": schema.BoolAttribute{
 						MarkdownDescription: "Indicates whether or not the MAC filter is turned on for the network.",
@@ -322,10 +329,12 @@ func (r *wlanFrameworkResource) Schema(
 				Default:             booldefault.StaticBool(false),
 			},
 			"minimum_data_rate_2g_kbps": schema.Int64Attribute{
-				MarkdownDescription: "Minimum data rate for 2G clients in Kbps.",
+				MarkdownDescription: "Minimum data rate for 2G clients in Kbps. If not specified, the API default is used.",
 				Optional:            true,
 				Computed:            true,
-				Default:             int64default.StaticInt64(0),
+				PlanModifiers: []planmodifier.Int64{
+					int64planmodifier.UseStateForUnknown(),
+				},
 				Validators: []validator.Int64{
 					int64validator.OneOf(
 						0,
@@ -345,10 +354,12 @@ func (r *wlanFrameworkResource) Schema(
 				},
 			},
 			"minimum_data_rate_5g_kbps": schema.Int64Attribute{
-				MarkdownDescription: "Minimum data rate for 5G clients in Kbps.",
+				MarkdownDescription: "Minimum data rate for 5G clients in Kbps. If not specified, the API default is used.",
 				Optional:            true,
 				Computed:            true,
-				Default:             int64default.StaticInt64(0),
+				PlanModifiers: []planmodifier.Int64{
+					int64planmodifier.UseStateForUnknown(),
+				},
 				Validators: []validator.Int64{
 					int64validator.OneOf(0, 6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000),
 				},
@@ -965,77 +976,57 @@ func (r *wlanFrameworkResource) planToWLAN(
 	return wlan, diags
 }
 
-// mergeWLAN merges planned WLAN changes into an existing WLAN from the API.
-// This preserves all API internal fields while applying terraform-managed changes.
+// mergeWLAN starts with terraform's planned values and preserves API-only fields
+// from the existing WLAN state. This ensures terraform-managed fields (including
+// defaults like minimum_data_rate=0) are applied, while API-internal fields are preserved.
 func (r *wlanFrameworkResource) mergeWLAN(
 	existing *unifi.WLAN,
 	planned *unifi.WLAN,
 ) *unifi.WLAN {
-	// Start with existing to preserve all UniFi internal fields
-	merged := *existing
+	// Start with our terraform values (includes defaults and state-preserved values)
+	merged := *planned
 
-	// Override with planned values (terraform-managed fields)
-	merged.Name = planned.Name
-	merged.NetworkID = planned.NetworkID
-	merged.UserGroupID = planned.UserGroupID
-	merged.Security = planned.Security
-	merged.WPA3Support = planned.WPA3Support
-	merged.WPA3Transition = planned.WPA3Transition
-	merged.PMFMode = planned.PMFMode
-	merged.XPassphrase = planned.XPassphrase
-	merged.HideSSID = planned.HideSSID
-	merged.IsGuest = planned.IsGuest
-	merged.Enabled = planned.Enabled
-	merged.ApGroupMode = planned.ApGroupMode
-	merged.VLANEnabled = planned.VLANEnabled
-	merged.VLAN = planned.VLAN
-	merged.MulticastEnhanceEnabled = planned.MulticastEnhanceEnabled
-	merged.RADIUSProfileID = planned.RADIUSProfileID
-	merged.NasIDentifierType = planned.NasIDentifierType
-	merged.No2GhzOui = planned.No2GhzOui
-	merged.L2Isolation = planned.L2Isolation
-	merged.ProxyArp = planned.ProxyArp
-	merged.BssTransition = planned.BssTransition
-	merged.UapsdEnabled = planned.UapsdEnabled
-	merged.FastRoamingEnabled = planned.FastRoamingEnabled
+	// Preserve API-only fields that we don't manage in our terraform schema.
+	// These are internal UniFi fields that must not be overwritten.
+	merged.ID = existing.ID
+	merged.SiteID = existing.SiteID
+	merged.WLANGroupID = existing.WLANGroupID
 
-	// Handle minimum data rate settings - only override if explicitly set
-	if planned.MinrateSettingPreference != "" {
-		merged.MinrateSettingPreference = planned.MinrateSettingPreference
+	// Preserve other API-managed internal fields
+	merged.GroupRekey = existing.GroupRekey
+	merged.DTIMMode = existing.DTIMMode
+	merged.WPAEnc = existing.WPAEnc
+	merged.WPAMode = existing.WPAMode
+	merged.NameCombineEnabled = existing.NameCombineEnabled
+	merged.NameCombineSuffix = existing.NameCombineSuffix
+	merged.AuthCache = existing.AuthCache
+	merged.OptimizeIotWifiConnectivity = existing.OptimizeIotWifiConnectivity
+
+	// Preserve slice fields from existing when planned has nil/empty values
+	// These are required by the API but might not be explicitly set in terraform
+	if len(planned.ApGroupIDs) == 0 {
+		merged.ApGroupIDs = existing.ApGroupIDs
 	}
-	// Only override minrate values if they're explicitly set (non-zero)
-	if planned.MinrateNgDataRateKbps != 0 {
-		merged.MinrateNgEnabled = planned.MinrateNgEnabled
-		merged.MinrateNgDataRateKbps = planned.MinrateNgDataRateKbps
+	if len(planned.WLANBands) == 0 {
+		merged.WLANBands = existing.WLANBands
+		merged.WLANBand = existing.WLANBand
 	}
-	if planned.MinrateNaDataRateKbps != 0 {
-		merged.MinrateNaEnabled = planned.MinrateNaEnabled
-		merged.MinrateNaDataRateKbps = planned.MinrateNaDataRateKbps
+	if len(planned.MACFilterList) == 0 {
+		merged.MACFilterList = existing.MACFilterList
+	}
+	if len(planned.ScheduleWithDuration) == 0 {
+		merged.ScheduleWithDuration = existing.ScheduleWithDuration
+		merged.ScheduleEnabled = existing.ScheduleEnabled
 	}
 
-	// Handle AP group IDs
-	if len(planned.ApGroupIDs) > 0 {
-		merged.ApGroupIDs = planned.ApGroupIDs
-	}
-
-	// Handle WLAN bands - only override WLANBands, let API compute WLANBand
-	if len(planned.WLANBands) > 0 {
-		merged.WLANBands = planned.WLANBands
-		// Don't override WLANBand - the API computes it from WLANBands
-		// Setting it explicitly can cause InvalidPayload or inconsistent results
-	}
-
-	// Handle MAC filter
-	merged.MACFilterEnabled = planned.MACFilterEnabled
-	merged.MACFilterPolicy = planned.MACFilterPolicy
-	if len(planned.MACFilterList) > 0 {
-		merged.MACFilterList = planned.MACFilterList
-	}
-
-	// Handle schedule
-	if len(planned.ScheduleWithDuration) > 0 {
-		merged.ScheduleWithDuration = planned.ScheduleWithDuration
-		merged.ScheduleEnabled = planned.ScheduleEnabled
+	// Preserve computed fields that don't have defaults removed
+	// These should use existing values when not explicitly set
+	if planned.MinrateNgDataRateKbps == 0 && planned.MinrateNaDataRateKbps == 0 {
+		merged.MinrateNgEnabled = existing.MinrateNgEnabled
+		merged.MinrateNgDataRateKbps = existing.MinrateNgDataRateKbps
+		merged.MinrateNaEnabled = existing.MinrateNaEnabled
+		merged.MinrateNaDataRateKbps = existing.MinrateNaDataRateKbps
+		merged.MinrateSettingPreference = existing.MinrateSettingPreference
 	}
 
 	return &merged
