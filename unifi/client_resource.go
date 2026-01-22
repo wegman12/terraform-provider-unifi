@@ -798,11 +798,8 @@ func (r *clientResource) Create(
 			return
 		}
 
-		// MAC in use, absorb the existing client as-is
-		// Note: The UniFi API has limitations that prevent reliable updates:
-		// - PUT /rest/user/{id} returns "not found" on some versions
-		// - delete+create races with device rediscovery
-		// So we simply absorb the existing client without modification.
+		// MAC in use - get existing client and update it
+		// Key: PUT /rest/user/{id} requires the UniFi-generated ID, not MAC
 		mac := plan.MAC.ValueString()
 		existingClient, err := r.client.GetClientByMAC(ctx, site, mac)
 		if err != nil {
@@ -812,7 +809,28 @@ func (r *clientResource) Create(
 			)
 			return
 		}
-		createdClient = existingClient
+
+		// Merge planned settings into existing client and update
+		mergedClient := r.mergeClient(existingClient, client)
+		mergedClient.ID = existingClient.ID // Ensure we use the UniFi-generated ID
+		_, err = r.client.UpdateClient(ctx, site, mergedClient)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Error Updating Existing Client",
+				"Could not update existing client (ID: "+existingClient.ID+"): "+err.Error(),
+			)
+			return
+		}
+
+		// Do a fresh GET to retrieve complete client data (PUT response lacks computed fields)
+		createdClient, err = r.client.GetClientByMAC(ctx, site, mac)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Error Reading Client After Update",
+				"Could not read client with MAC "+mac+": "+err.Error(),
+			)
+			return
+		}
 	}
 
 	// Convert response back to model
@@ -985,13 +1003,10 @@ func (r *clientResource) Update(
 		site = r.client.Site
 	}
 
-	// Step 3: Refresh from API
-	// Note: The UniFi API has limitations that prevent reliable updates:
-	// - PUT /rest/user/{id} returns "not found" on some versions
-	// - delete+create races with device rediscovery
-	// So we just refresh the state from the API without making changes.
+	// Step 3: Get existing client to retrieve UniFi ID, then update
+	// Key: PUT /rest/user/{id} requires the UniFi-generated ID, not MAC
 	mac := state.MAC.ValueString()
-	updatedClient, err := r.client.GetClientByMAC(ctx, site, mac)
+	existingClient, err := r.client.GetClientByMAC(ctx, site, mac)
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error Reading Client",
@@ -1000,8 +1015,37 @@ func (r *clientResource) Update(
 		return
 	}
 
+	// Convert state to API client struct and update
+	client, diags := r.planToClient(ctx, state)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Merge with existing and use UniFi-generated ID for PUT
+	mergedClient := r.mergeClient(existingClient, client)
+	mergedClient.ID = existingClient.ID
+	_, err = r.client.UpdateClient(ctx, site, mergedClient)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error Updating Client",
+			"Could not update client (ID: "+existingClient.ID+"): "+err.Error(),
+		)
+		return
+	}
+
+	// Do a fresh GET to retrieve complete client data (PUT response lacks computed fields)
+	updatedClient, err := r.client.GetClientByMAC(ctx, site, mac)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error Reading Client After Update",
+			"Could not read client with MAC "+mac+": "+err.Error(),
+		)
+		return
+	}
+
 	// Step 4: Update state with API response
-	diags := r.clientToModel(ctx, updatedClient, &state, site)
+	diags = r.clientToModel(ctx, updatedClient, &state, site)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -1169,22 +1213,32 @@ func (r *clientResource) planToClient(
 		return nil, diags
 	}
 
+	fixedIP := plan.FixedIP.ValueString()
+	networkID := plan.NetworkID.ValueString()
+
 	client := &unifi.Client{
 		ID:             plan.ID.ValueString(),
 		MAC:            plan.MAC.ValueString(),
 		Name:           plan.Name.ValueString(),
 		UserGroupID:    plan.GroupID.ValueString(),
 		Note:           plan.Note.ValueString(),
-		FixedIP:        plan.FixedIP.ValueString(),
-		NetworkID:      plan.NetworkID.ValueString(),
+		FixedIP:        fixedIP,
+		NetworkID:      networkID,
 		Blocked:        plan.Blocked.ValueBool(),
 		LocalDNSRecord: plan.LocalDNSRecord.ValueString(),
 	}
 
-	// Note: DevIDOverride is not available in the Client type
-	// if !plan.DevIDOverride.IsNull() && !plan.DevIDOverride.IsUnknown() {
-	// 	client.DevIdOverride = plan.DevIDOverride.ValueInt64()
-	// }
+	// Enable fixed IP if a fixed IP is specified
+	if fixedIP != "" {
+		client.UseFixedIP = true
+	}
+
+	// Enable virtual network override if network_id is specified
+	// This is required on UDM SE to assign clients to specific VLANs
+	if networkID != "" {
+		client.VirtualNetworkOverrideEnabled = true
+		client.VirtualNetworkOverrideID = networkID
+	}
 
 	return client, diags
 }
@@ -1438,6 +1492,11 @@ func (r *clientResource) mergeClient(
 	merged.NetworkID = planned.NetworkID
 	merged.Blocked = planned.Blocked
 	merged.LocalDNSRecord = planned.LocalDNSRecord
+
+	// Set fixed IP and virtual network override flags
+	merged.UseFixedIP = planned.UseFixedIP
+	merged.VirtualNetworkOverrideEnabled = planned.VirtualNetworkOverrideEnabled
+	merged.VirtualNetworkOverrideID = planned.VirtualNetworkOverrideID
 
 	return &merged
 }

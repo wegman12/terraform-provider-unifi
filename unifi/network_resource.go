@@ -51,6 +51,9 @@ type networkResourceModel struct {
 	Subnet       types.String `tfsdk:"subnet"`
 	NetworkGroup types.String `tfsdk:"network_group"`
 
+	// Network state
+	InternetAccessEnabled types.Bool `tfsdk:"internet_access_enabled"`
+
 	// DHCP Settings
 	DhcpStart        types.String `tfsdk:"dhcp_start"`
 	DhcpStop         types.String `tfsdk:"dhcp_stop"`
@@ -183,6 +186,12 @@ func (r *networkResource) Schema(
 				Optional:            true,
 				Computed:            true,
 				Default:             stringdefault.StaticString("LAN"),
+			},
+			"internet_access_enabled": schema.BoolAttribute{
+				MarkdownDescription: "Specifies whether this network has access to the internet. Defaults to `true`.",
+				Optional:            true,
+				Computed:            true,
+				Default:             booldefault.StaticBool(true),
 			},
 
 			// DHCP Settings
@@ -647,9 +656,25 @@ func (r *networkResource) Update(
 		site = r.client.Site
 	}
 
-	// Step 4: Send to API
-	network.ID = state.ID.ValueString()
-	updatedNetwork, err := r.client.UpdateNetwork(ctx, site, network)
+	// Step 4: Send to API using merge pattern to preserve existing fields
+	// This is critical because the UniFi API has many fields (like Enabled)
+	// that aren't in our schema but need to be preserved during updates.
+	networkID := state.ID.ValueString()
+
+	// Get existing network from API
+	existing, err := r.client.GetNetwork(ctx, site, networkID)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error Reading Network for Update",
+			err.Error(),
+		)
+		return
+	}
+
+	// Merge: Start with our terraform values and preserve API-only fields from existing
+	mergedNetwork := mergeNetworkForUpdate(existing, network)
+
+	updatedNetwork, err := r.client.UpdateNetwork(ctx, site, mergedNetwork)
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error Updating Network",
@@ -693,6 +718,9 @@ func (r *networkResource) applyPlanToState(
 	}
 	if !plan.NetworkGroup.IsNull() && !plan.NetworkGroup.IsUnknown() {
 		state.NetworkGroup = plan.NetworkGroup
+	}
+	if !plan.InternetAccessEnabled.IsNull() && !plan.InternetAccessEnabled.IsUnknown() {
+		state.InternetAccessEnabled = plan.InternetAccessEnabled
 	}
 
 	// DHCP Settings
@@ -935,6 +963,13 @@ func (r *networkResource) modelToNetwork(
 		network.NetworkGroup = model.NetworkGroup.ValueString()
 	}
 
+	// Internet access - default to true if not explicitly set
+	if !model.InternetAccessEnabled.IsNull() {
+		network.InternetAccessEnabled = model.InternetAccessEnabled.ValueBool()
+	} else {
+		network.InternetAccessEnabled = true
+	}
+
 	// DHCP Settings
 	if !model.DhcpStart.IsNull() {
 		network.DHCPDStart = model.DhcpStart.ValueString()
@@ -1025,6 +1060,8 @@ func (r *networkResource) networkToModel(
 	} else {
 		model.NetworkGroup = types.StringValue("LAN") // Default value
 	}
+
+	model.InternetAccessEnabled = types.BoolValue(network.InternetAccessEnabled)
 
 	// DHCP Settings
 	if network.DHCPDStart != "" {
@@ -1132,4 +1169,30 @@ func (r *networkResource) networkToModel(
 	model.WireguardPrivateKey = types.StringNull()
 
 	return diags
+}
+
+// mergeNetworkForUpdate starts with terraform's planned values and preserves
+// API-only fields from the existing network state.
+// This approach ensures:
+// 1. All terraform-managed fields use our computed values (including defaults)
+// 2. API-internal fields we don't manage are preserved
+func mergeNetworkForUpdate(existing, planned *unifi.Network) *unifi.Network {
+	// Start with our terraform values (includes defaults and state-preserved values)
+	merged := *planned
+
+	// Preserve API-only fields that we don't manage in our terraform schema.
+	// These are internal UniFi fields that must not be overwritten.
+	merged.ID = existing.ID           // Required for PUT requests
+	merged.Enabled = existing.Enabled // Network pause/unpause state
+	merged.SiteID = existing.SiteID   // Internal site reference
+
+	// Preserve other API-managed fields that aren't in our schema
+	merged.IsNAT = existing.IsNAT
+	merged.LteLanEnabled = existing.LteLanEnabled
+	merged.AutoScaleEnabled = existing.AutoScaleEnabled
+	merged.SettingPreference = existing.SettingPreference
+	merged.WANLoadBalanceType = existing.WANLoadBalanceType
+	merged.WANLoadBalanceWeight = existing.WANLoadBalanceWeight
+
+	return &merged
 }

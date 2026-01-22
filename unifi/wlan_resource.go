@@ -620,25 +620,50 @@ func (r *wlanFrameworkResource) Update(
 		site = r.client.Site
 	}
 
-	// Step 3: Convert the updated state to API format
-	wlan, diags := r.planToWLAN(ctx, state)
+	wlanID := state.ID.ValueString()
+
+	// Step 3: GET existing WLAN from API to preserve all fields
+	existingWLAN, err := r.client.GetWLAN(ctx, site, wlanID)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error Reading WLAN",
+			"Could not read WLAN with ID "+wlanID+": "+err.Error(),
+		)
+		return
+	}
+
+	// Step 4: Convert the updated state to API format
+	plannedWLAN, diags := r.planToWLAN(ctx, state)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	// Step 4: Send to API
-	wlan.ID = state.ID.ValueString()
-	updatedWLAN, err := r.client.UpdateWLAN(ctx, site, wlan)
+	// Step 5: Merge planned changes into existing WLAN
+	mergedWLAN := r.mergeWLAN(existingWLAN, plannedWLAN)
+	mergedWLAN.ID = wlanID
+
+	// Step 6: Send to API
+	_, err = r.client.UpdateWLAN(ctx, site, mergedWLAN)
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error Updating WLAN",
-			"Could not update WLAN with ID "+state.ID.ValueString()+": "+err.Error(),
+			"Could not update WLAN with ID "+wlanID+": "+err.Error(),
 		)
 		return
 	}
 
-	// Step 5: Update state with API response
+	// Step 7: Do a fresh GET to retrieve complete WLAN data
+	updatedWLAN, err := r.client.GetWLAN(ctx, site, wlanID)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error Reading WLAN After Update",
+			"Could not read WLAN with ID "+wlanID+": "+err.Error(),
+		)
+		return
+	}
+
+	// Step 8: Update state with API response
 	diags = r.wlanToModel(ctx, updatedWLAN, &state, site)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
@@ -938,6 +963,82 @@ func (r *wlanFrameworkResource) planToWLAN(
 	}
 
 	return wlan, diags
+}
+
+// mergeWLAN merges planned WLAN changes into an existing WLAN from the API.
+// This preserves all API internal fields while applying terraform-managed changes.
+func (r *wlanFrameworkResource) mergeWLAN(
+	existing *unifi.WLAN,
+	planned *unifi.WLAN,
+) *unifi.WLAN {
+	// Start with existing to preserve all UniFi internal fields
+	merged := *existing
+
+	// Override with planned values (terraform-managed fields)
+	merged.Name = planned.Name
+	merged.NetworkID = planned.NetworkID
+	merged.UserGroupID = planned.UserGroupID
+	merged.Security = planned.Security
+	merged.WPA3Support = planned.WPA3Support
+	merged.WPA3Transition = planned.WPA3Transition
+	merged.PMFMode = planned.PMFMode
+	merged.XPassphrase = planned.XPassphrase
+	merged.HideSSID = planned.HideSSID
+	merged.IsGuest = planned.IsGuest
+	merged.Enabled = planned.Enabled
+	merged.ApGroupMode = planned.ApGroupMode
+	merged.VLANEnabled = planned.VLANEnabled
+	merged.VLAN = planned.VLAN
+	merged.MulticastEnhanceEnabled = planned.MulticastEnhanceEnabled
+	merged.RADIUSProfileID = planned.RADIUSProfileID
+	merged.NasIDentifierType = planned.NasIDentifierType
+	merged.No2GhzOui = planned.No2GhzOui
+	merged.L2Isolation = planned.L2Isolation
+	merged.ProxyArp = planned.ProxyArp
+	merged.BssTransition = planned.BssTransition
+	merged.UapsdEnabled = planned.UapsdEnabled
+	merged.FastRoamingEnabled = planned.FastRoamingEnabled
+
+	// Handle minimum data rate settings - only override if explicitly set
+	if planned.MinrateSettingPreference != "" {
+		merged.MinrateSettingPreference = planned.MinrateSettingPreference
+	}
+	// Only override minrate values if they're explicitly set (non-zero)
+	if planned.MinrateNgDataRateKbps != 0 {
+		merged.MinrateNgEnabled = planned.MinrateNgEnabled
+		merged.MinrateNgDataRateKbps = planned.MinrateNgDataRateKbps
+	}
+	if planned.MinrateNaDataRateKbps != 0 {
+		merged.MinrateNaEnabled = planned.MinrateNaEnabled
+		merged.MinrateNaDataRateKbps = planned.MinrateNaDataRateKbps
+	}
+
+	// Handle AP group IDs
+	if len(planned.ApGroupIDs) > 0 {
+		merged.ApGroupIDs = planned.ApGroupIDs
+	}
+
+	// Handle WLAN bands - only override WLANBands, let API compute WLANBand
+	if len(planned.WLANBands) > 0 {
+		merged.WLANBands = planned.WLANBands
+		// Don't override WLANBand - the API computes it from WLANBands
+		// Setting it explicitly can cause InvalidPayload or inconsistent results
+	}
+
+	// Handle MAC filter
+	merged.MACFilterEnabled = planned.MACFilterEnabled
+	merged.MACFilterPolicy = planned.MACFilterPolicy
+	if len(planned.MACFilterList) > 0 {
+		merged.MACFilterList = planned.MACFilterList
+	}
+
+	// Handle schedule
+	if len(planned.ScheduleWithDuration) > 0 {
+		merged.ScheduleWithDuration = planned.ScheduleWithDuration
+		merged.ScheduleEnabled = planned.ScheduleEnabled
+	}
+
+	return &merged
 }
 
 func (r *wlanFrameworkResource) wlanToModel(
