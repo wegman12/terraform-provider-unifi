@@ -71,6 +71,7 @@ type portProfileResourceModel struct {
 	StormctrlUcastLevel        types.Int64  `tfsdk:"stormctrl_ucast_level"`
 	StormctrlUcastRate         types.Int64  `tfsdk:"stormctrl_ucast_rate"`
 	STPPortMode                types.Bool   `tfsdk:"stp_port_mode"`
+	QOSProfileMode             types.String `tfsdk:"qos_profile_mode"`
 	TaggedNetworkConfIDs       types.Set    `tfsdk:"tagged_networkconf_ids"`
 	VoiceNetworkConfID         types.String `tfsdk:"voice_networkconf_id"`
 }
@@ -341,6 +342,11 @@ func (r *portProfileResource) Schema(
 				Description: "Enable Spanning Tree Protocol (STP) for the port profile.",
 				Optional:    true,
 			},
+			"qos_profile_mode": schema.StringAttribute{
+				Description: "QoS profile mode. Use 'custom' for standard Active port mode. Other values enable Pro AV modes: unifi_play, aes67_audio, crestron_audio_video, dante_audio, ndi_aes67_audio, ndi_dante_audio, qsys_audio_video, qsys_video_dante_audio, sdvoe_aes67_audio, sdvoe_dante_audio, shure_audio.",
+				Optional:    true,
+				Computed:    true,
+			},
 			"tagged_networkconf_ids": schema.SetAttribute{
 				Description: "The IDs of networks to tag traffic with for the port profile.",
 				Optional:    true,
@@ -411,10 +417,10 @@ func (r *portProfileResource) Create(
 		return
 	}
 
-	// Set state
+	// Set state - preserve plan values for fields the API doesn't return correctly
 	plan.ID = types.StringValue(apiPortProfile.ID)
 	plan.Site = types.StringValue(site)
-	r.setResourceData(ctx, apiPortProfile, &plan, site)
+	r.setResourceData(ctx, apiPortProfile, &plan, site, &plan)
 
 	diags = resp.State.Set(ctx, plan)
 	resp.Diagnostics.Append(diags...)
@@ -451,8 +457,9 @@ func (r *portProfileResource) Read(
 		return
 	}
 
-	// Update state from API response
-	r.setResourceData(ctx, portProfile, &state, site)
+	// Update state from API response - preserve user-controlled fields from current state
+	// because the API doesn't return correct values for forward, stp_port_mode, native_networkconf_id
+	r.setResourceData(ctx, portProfile, &state, site, &state)
 
 	diags = resp.State.Set(ctx, state)
 	resp.Diagnostics.Append(diags...)
@@ -494,8 +501,8 @@ func (r *portProfileResource) Update(
 		return
 	}
 
-	// Apply current API values to state
-	r.setResourceData(ctx, currentPortProfile, &state, site)
+	// Apply current API values to state (no prior plan for initial read)
+	r.setResourceData(ctx, currentPortProfile, &state, site, nil)
 
 	// Apply plan changes to the state (merge pattern)
 	r.applyPlanToState(ctx, &plan, &state)
@@ -519,8 +526,8 @@ func (r *portProfileResource) Update(
 		return
 	}
 
-	// Update state from API response
-	r.setResourceData(ctx, apiPortProfile, &state, site)
+	// Update state from API response - preserve plan values for fields API doesn't return correctly
+	r.setResourceData(ctx, apiPortProfile, &state, site, &plan)
 
 	diags = resp.State.Set(ctx, state)
 	resp.Diagnostics.Append(diags...)
@@ -623,7 +630,10 @@ func (r *portProfileResource) modelToAPIPortProfile(
 		portProfile.LldpmedNotifyEnabled = model.LLDPMedNotifyEnabled.ValueBool()
 	}
 
-	// Skip native network config for now as field name is unclear
+	// Set native network config ID (for access ports)
+	if !model.NativeNetworkConfID.IsNull() && !model.NativeNetworkConfID.IsUnknown() {
+		portProfile.NATiveNetworkID = model.NativeNetworkConfID.ValueString()
+	}
 
 	if !model.PoeMode.IsNull() && !model.PoeMode.IsUnknown() {
 		portProfile.PoeMode = model.PoeMode.ValueString()
@@ -648,6 +658,19 @@ func (r *portProfileResource) modelToAPIPortProfile(
 
 	// Convert tagged network IDs - skip for now as field name is unclear
 
+	// Set STP port mode
+	if !model.STPPortMode.IsNull() && !model.STPPortMode.IsUnknown() {
+		portProfile.StpPortMode = model.STPPortMode.ValueBool()
+	}
+
+	// Set QOS profile mode (custom = Active mode, others = Pro AV modes)
+	if !model.QOSProfileMode.IsNull() && !model.QOSProfileMode.IsUnknown() {
+		portProfile.QOSProfile = unifi.PortProfileQOSProfile{
+			QOSProfileMode: model.QOSProfileMode.ValueString(),
+			QOSPolicies:    []unifi.PortProfileQOSPolicies{},
+		}
+	}
+
 	// Handle storm control and other complex fields as needed...
 
 	return portProfile, diags
@@ -658,6 +681,7 @@ func (r *portProfileResource) setResourceData(
 	portProfile *unifi.PortProfile,
 	model *portProfileResourceModel,
 	site string,
+	priorPlan *portProfileResourceModel,
 ) {
 	model.Site = types.StringValue(site)
 
@@ -677,7 +701,10 @@ func (r *portProfileResource) setResourceData(
 
 	model.Dot1XIdleTimeout = types.Int64Value(portProfile.Dot1XIDleTimeout)
 
-	if portProfile.Forward == "" {
+	// Preserve Forward from prior plan - API changes "native" to "customize" when native_networkconf_id is set
+	if priorPlan != nil && !priorPlan.Forward.IsNull() && !priorPlan.Forward.IsUnknown() {
+		model.Forward = priorPlan.Forward
+	} else if portProfile.Forward == "" {
 		model.Forward = types.StringValue("native")
 	} else {
 		model.Forward = types.StringValue(portProfile.Forward)
@@ -696,7 +723,14 @@ func (r *portProfileResource) setResourceData(
 		model.LLDPMedNotifyEnabled = types.BoolNull()
 	}
 
-	model.NativeNetworkConfID = types.StringNull() // Skip for now
+	// Preserve native_networkconf_id from prior plan - API may return unexpected values
+	if priorPlan != nil && !priorPlan.NativeNetworkConfID.IsUnknown() {
+		model.NativeNetworkConfID = priorPlan.NativeNetworkConfID
+	} else if portProfile.NATiveNetworkID != "" {
+		model.NativeNetworkConfID = types.StringValue(portProfile.NATiveNetworkID)
+	} else {
+		model.NativeNetworkConfID = types.StringNull()
+	}
 
 	if portProfile.OpMode == "" {
 		model.OpMode = types.StringValue("switch")
@@ -753,7 +787,19 @@ func (r *portProfileResource) setResourceData(
 	model.StormctrlUcastEnabled = types.BoolValue(false)
 	model.StormctrlUcastLevel = types.Int64Null()
 	model.StormctrlUcastRate = types.Int64Null()
-	model.STPPortMode = types.BoolNull()
+	// Preserve stp_port_mode from prior plan - API may not return the correct value
+	if priorPlan != nil && !priorPlan.STPPortMode.IsNull() && !priorPlan.STPPortMode.IsUnknown() {
+		model.STPPortMode = priorPlan.STPPortMode
+	} else {
+		model.STPPortMode = types.BoolValue(portProfile.StpPortMode)
+	}
+
+	// Set QOS profile mode from API response
+	if portProfile.QOSProfile.QOSProfileMode != "" {
+		model.QOSProfileMode = types.StringValue(portProfile.QOSProfile.QOSProfileMode)
+	} else {
+		model.QOSProfileMode = types.StringNull()
+	}
 }
 
 func (r *portProfileResource) applyPlanToState(
@@ -818,6 +864,9 @@ func (r *portProfileResource) applyPlanToState(
 	}
 	if !plan.VoiceNetworkConfID.IsNull() && !plan.VoiceNetworkConfID.IsUnknown() {
 		state.VoiceNetworkConfID = plan.VoiceNetworkConfID
+	}
+	if !plan.QOSProfileMode.IsNull() && !plan.QOSProfileMode.IsUnknown() {
+		state.QOSProfileMode = plan.QOSProfileMode
 	}
 	// Apply other fields as needed...
 }

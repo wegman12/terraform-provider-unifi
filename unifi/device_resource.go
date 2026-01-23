@@ -989,9 +989,14 @@ func (r *deviceResource) Read(
 		return
 	}
 
-	// Preserve plan-only flags before reading API state
+	// Preserve plan-only flags and port_override before reading API state.
+	// Port overrides must be preserved because setResourceData populates all
+	// fields from the API, but Terraform's Set type requires exact value matching.
+	// If we don't preserve the state's structure, terraform refresh would show
+	// spurious changes.
 	allowAdoption := state.AllowAdoption
 	forgetOnDestroy := state.ForgetOnDestroy
+	portOverride := state.PortOverride
 
 	id := state.ID.ValueString()
 	site := state.Site.ValueString()
@@ -1018,9 +1023,12 @@ func (r *deviceResource) Read(
 		return
 	}
 
-	// Restore plan-only flags
+	// Restore plan-only flags and port_override
 	state.AllowAdoption = allowAdoption
 	state.ForgetOnDestroy = forgetOnDestroy
+	if !portOverride.IsNull() && !portOverride.IsUnknown() {
+		state.PortOverride = portOverride
+	}
 
 	diags = resp.State.Set(ctx, state)
 	resp.Diagnostics.Append(diags...)
@@ -1237,6 +1245,13 @@ func (r *deviceResource) updateDevice(
 		site = r.client.Site
 	}
 
+	// Preserve the planned PortOverride before setResourceData overwrites it.
+	// This is necessary because setResourceData populates all fields from the API,
+	// but Terraform's Set type requires exact value matching for element correlation.
+	// If we don't preserve the plan's structure (with null for unset Optional fields),
+	// the planned element won't match the actual element and Terraform will error.
+	plannedPortOverride := model.PortOverride
+
 	// Convert model to API request
 	deviceReq, convDiags := r.modelToAPIDevice(ctx, model)
 	diags.Append(convDiags...)
@@ -1285,6 +1300,13 @@ func (r *deviceResource) updateDevice(
 
 	// Update state from API response
 	r.setResourceData(ctx, &diags, device, model, site)
+
+	// Restore the planned PortOverride to ensure Terraform can correlate
+	// the planned elements with actual elements in the Set.
+	if !plannedPortOverride.IsNull() && !plannedPortOverride.IsUnknown() {
+		model.PortOverride = plannedPortOverride
+	}
+
 	return diags
 }
 

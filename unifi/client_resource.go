@@ -833,8 +833,8 @@ func (r *clientResource) Create(
 		}
 	}
 
-	// Convert response back to model
-	diags = r.clientToModel(ctx, createdClient, &plan, site)
+	// Convert response back to model (no prior state for Create)
+	diags = r.clientToModel(ctx, createdClient, &plan, site, nil)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -932,8 +932,8 @@ func (r *clientResource) Read(
 		return
 	}
 
-	// Convert API response to model
-	resp.Diagnostics.Append(r.clientToModel(ctx, client, &state, site)...)
+	// Convert API response to model (no prior state for Read - we want fresh values)
+	resp.Diagnostics.Append(r.clientToModel(ctx, client, &state, site, nil)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -1045,7 +1045,10 @@ func (r *clientResource) Update(
 	}
 
 	// Step 4: Update state with API response
-	diags = r.clientToModel(ctx, updatedClient, &state, site)
+	// Get prior state to preserve volatile fields (uptime, last_seen, etc.)
+	var priorState clientResourceModel
+	req.State.Get(ctx, &priorState)
+	diags = r.clientToModel(ctx, updatedClient, &state, site, &priorState)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -1248,6 +1251,7 @@ func (r *clientResource) clientToModel(
 	client *unifi.Client,
 	model *clientResourceModel,
 	site string,
+	priorState *clientResourceModel,
 ) diag.Diagnostics {
 	var diags diag.Diagnostics
 
@@ -1266,7 +1270,14 @@ func (r *clientResource) clientToModel(
 	model.GroupID = util.StringValueOrNull(client.UserGroupID)
 	model.Note = util.StringValueOrNull(client.Note)
 	model.FixedIP = util.StringValueOrNull(client.FixedIP)
-	model.NetworkID = util.StringValueOrNull(client.NetworkID)
+	// When virtual_network_override is enabled, use that ID as the effective network.
+	// The stat/user endpoint returns the physical connection network in network_id,
+	// but the configured network assignment is in virtual_network_override_id.
+	if client.VirtualNetworkOverrideEnabled && client.VirtualNetworkOverrideID != "" {
+		model.NetworkID = util.StringValueOrNull(client.VirtualNetworkOverrideID)
+	} else {
+		model.NetworkID = util.StringValueOrNull(client.NetworkID)
+	}
 
 	model.Blocked = types.BoolValue(client.Blocked)
 	model.DevIDOverride = types.Int64PointerValue(client.DevIdOverride)
@@ -1297,7 +1308,13 @@ func (r *clientResource) clientToModel(
 	model.QOSPolicyApplied = types.BoolValue(client.QOSPolicyApplied)
 	model.Satisfaction = types.Int64PointerValue(client.Satisfaction)
 	model.TxRetries = types.Int64PointerValue(client.TxRetries)
-	model.Uptime = types.Int64PointerValue(client.Uptime)
+	// Preserve uptime from prior state to avoid inconsistency errors
+	// (uptime changes between plan and apply completion)
+	if priorState != nil && !priorState.Uptime.IsNull() {
+		model.Uptime = priorState.Uptime
+	} else {
+		model.Uptime = types.Int64PointerValue(client.Uptime)
+	}
 	model.UserID = util.StringValueOrNull(client.UserID)
 	model.VLAN = types.Int64PointerValue(client.VLAN)
 
@@ -1375,23 +1392,28 @@ func (r *clientResource) clientToModel(
 		lastIPv6 = types.ListNull(types.StringType)
 	}
 
-	lastValues := map[string]attr.Value{
-		"identity_1x":             util.StringValueOrNull(client.Last1xIdentity),
-		"connection_network_id":   util.StringValueOrNull(client.LastConnectionNetworkID),
-		"connection_network_name": util.StringValueOrNull(client.LastConnectionNetworkName),
-		"ip":                      util.StringValueOrNull(client.LastIP),
-		"ipv6":                    lastIPv6,
-		"reachable_by_gw":         types.Int64PointerValue(client.LastReachableByGW),
-		"seen":                    types.Int64PointerValue(client.LastSeen),
-		"seen_by_ugw":             types.Int64PointerValue(client.LastSeenByUGW),
-		"seen_by_usw":             types.Int64PointerValue(client.LastSeenByUSW),
-		"uplink_mac":              util.StringValueOrNull(client.LastUplinkMAC),
-		"uplink_name":             util.StringValueOrNull(client.LastUplinkName),
-		"uplink_remote_port":      types.Int64PointerValue(client.LastUplinkRemotePort),
+	// Preserve volatile last_* fields from prior state to avoid inconsistency errors
+	if priorState != nil && !priorState.Last.IsNull() {
+		model.Last = priorState.Last
+	} else {
+		lastValues := map[string]attr.Value{
+			"identity_1x":             util.StringValueOrNull(client.Last1xIdentity),
+			"connection_network_id":   util.StringValueOrNull(client.LastConnectionNetworkID),
+			"connection_network_name": util.StringValueOrNull(client.LastConnectionNetworkName),
+			"ip":                      util.StringValueOrNull(client.LastIP),
+			"ipv6":                    lastIPv6,
+			"reachable_by_gw":         types.Int64PointerValue(client.LastReachableByGW),
+			"seen":                    types.Int64PointerValue(client.LastSeen),
+			"seen_by_ugw":             types.Int64PointerValue(client.LastSeenByUGW),
+			"seen_by_usw":             types.Int64PointerValue(client.LastSeenByUSW),
+			"uplink_mac":              util.StringValueOrNull(client.LastUplinkMAC),
+			"uplink_name":             util.StringValueOrNull(client.LastUplinkName),
+			"uplink_remote_port":      types.Int64PointerValue(client.LastUplinkRemotePort),
+		}
+		var lastDiags diag.Diagnostics
+		model.Last, lastDiags = types.ObjectValue(lastAttrs, lastValues)
+		diags.Append(lastDiags...)
 	}
-	var lastDiags diag.Diagnostics
-	model.Last, lastDiags = types.ObjectValue(lastAttrs, lastValues)
-	diags.Append(lastDiags...)
 
 	// Switch nested object
 	switchAttrs := map[string]attr.Type{
@@ -1413,19 +1435,24 @@ func (r *clientResource) clientToModel(
 	}
 
 	// Uptime stats nested object
-	uptimeStatsAttrs := map[string]attr.Type{
-		"uptime":        types.Int64Type,
-		"uptime_by_ugw": types.Int64Type,
-		"uptime_by_usw": types.Int64Type,
+	// Preserve from prior state to avoid inconsistency errors
+	if priorState != nil && !priorState.UptimeStats.IsNull() {
+		model.UptimeStats = priorState.UptimeStats
+	} else {
+		uptimeStatsAttrs := map[string]attr.Type{
+			"uptime":        types.Int64Type,
+			"uptime_by_ugw": types.Int64Type,
+			"uptime_by_usw": types.Int64Type,
+		}
+		uptimeStatsValues := map[string]attr.Value{
+			"uptime":        types.Int64PointerValue(client.Uptime),
+			"uptime_by_ugw": types.Int64PointerValue(client.UptimeByUGW),
+			"uptime_by_usw": types.Int64PointerValue(client.UptimeByUSW),
+		}
+		var uptimeDiags diag.Diagnostics
+		model.UptimeStats, uptimeDiags = types.ObjectValue(uptimeStatsAttrs, uptimeStatsValues)
+		diags.Append(uptimeDiags...)
 	}
-	uptimeStatsValues := map[string]attr.Value{
-		"uptime":        types.Int64PointerValue(client.Uptime),
-		"uptime_by_ugw": types.Int64PointerValue(client.UptimeByUGW),
-		"uptime_by_usw": types.Int64PointerValue(client.UptimeByUSW),
-	}
-	var uptimeDiags diag.Diagnostics
-	model.UptimeStats, uptimeDiags = types.ObjectValue(uptimeStatsAttrs, uptimeStatsValues)
-	diags.Append(uptimeDiags...)
 
 	// WiFi nested object
 	wifiAttrs := map[string]attr.Type{
@@ -1582,9 +1609,9 @@ func (r *clientResource) List(
 					types.StringValue(client.MAC),
 				)...)
 
-			// Convert the client to the resource model
+			// Convert the client to the resource model (no prior state for List)
 			var model clientResourceModel
-			modelDiags := r.clientToModel(ctx, &client, &model, site)
+			modelDiags := r.clientToModel(ctx, &client, &model, site, nil)
 			result.Diagnostics.Append(modelDiags...)
 
 			// Set the resource information on the result
