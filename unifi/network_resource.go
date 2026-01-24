@@ -60,6 +60,7 @@ type networkResourceModel struct {
 	DhcpEnabled      types.Bool   `tfsdk:"dhcp_enabled"`
 	DhcpLease        types.Int64  `tfsdk:"dhcp_lease"`
 	DhcpDNS          types.List   `tfsdk:"dhcp_dns"`
+	DhcpDNSEnabled   types.Bool   `tfsdk:"dhcp_dns_enabled"`
 	DhcpRelayEnabled types.Bool   `tfsdk:"dhcp_relay_enabled"`
 
 	// DHCPD Boot Settings
@@ -226,6 +227,11 @@ func (r *networkResource) Schema(
 				Validators: []validator.List{
 					listvalidator.SizeAtMost(4),
 				},
+			},
+			"dhcp_dns_enabled": schema.BoolAttribute{
+				MarkdownDescription: "Specifies whether to use the custom DNS servers specified in `dhcp_dns`. Set to `false` to use custom DNS, `true` for auto DNS (default).",
+				Optional:            true,
+				Computed:            true,
 			},
 			"dhcpd_boot_enabled": schema.BoolAttribute{
 				MarkdownDescription: "Toggles on the DHCP boot options. Should be set to true when you want to have dhcpd_boot_filename, and dhcpd_boot_server to take effect.",
@@ -980,6 +986,9 @@ func (r *networkResource) modelToNetwork(
 	if !model.DhcpEnabled.IsNull() {
 		network.DHCPDEnabled = model.DhcpEnabled.ValueBool()
 	}
+	if !model.DhcpDNSEnabled.IsNull() {
+		network.DHCPDDNSEnabled = model.DhcpDNSEnabled.ValueBool()
+	}
 	if !model.DhcpLease.IsNull() {
 		network.DHCPDLeaseTime = model.DhcpLease.ValueInt64()
 	}
@@ -1077,6 +1086,7 @@ func (r *networkResource) networkToModel(
 	}
 
 	model.DhcpEnabled = types.BoolValue(network.DHCPDEnabled)
+	model.DhcpDNSEnabled = types.BoolValue(network.DHCPDDNSEnabled)
 
 	if network.DHCPDLeaseTime != 0 {
 		model.DhcpLease = types.Int64Value(network.DHCPDLeaseTime)
