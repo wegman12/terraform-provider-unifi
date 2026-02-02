@@ -199,7 +199,6 @@ func (r *wanResource) Schema(
 			"egress_qos_enabled": schema.BoolAttribute{
 				Optional:            true,
 				Computed:            true,
-				Default:             booldefault.StaticBool(false),
 				MarkdownDescription: "Whether egress QoS is enabled",
 			},
 			"dhcp_cos": schema.Int64Attribute{
@@ -320,7 +319,6 @@ func (r *wanResource) Schema(
 			"upnp_enabled": schema.BoolAttribute{
 				Optional:            true,
 				Computed:            true,
-				Default:             booldefault.StaticBool(false),
 				MarkdownDescription: "Whether UPnP is enabled",
 			},
 			"upnp_wan_interface": schema.StringAttribute{
@@ -330,13 +328,11 @@ func (r *wanResource) Schema(
 			"upnp_nat_pmp_enabled": schema.BoolAttribute{
 				Optional:            true,
 				Computed:            true,
-				Default:             booldefault.StaticBool(false),
 				MarkdownDescription: "Whether UPnP NAT-PMP is enabled",
 			},
 			"upnp_secure_mode": schema.BoolAttribute{
 				Optional:            true,
 				Computed:            true,
-				Default:             booldefault.StaticBool(false),
 				MarkdownDescription: "Whether UPnP secure mode is enabled",
 			},
 			"load_balance_type": schema.StringAttribute{
@@ -786,18 +782,32 @@ func (r *wanResource) modelToNetwork(
 	var diags diag.Diagnostics
 
 	network := &unifi.Network{
-		Name:                model.Name.ValueString(),
-		Purpose:             "wan", // Statically set to "wan"
-		WANNetworkGroup:     "WAN", // Statically set to "WAN"
-		HiddenID:            "WAN", // Statically set to "WAN"
-		WANType:             model.Type.ValueString(),
-		WANTypeV6:           model.TypeV6.ValueString(),
-		WANVLANEnabled:      model.VlanEnabled.ValueBool(),
-		WANVLAN:             model.Vlan.ValueInt64(),
-		WANEgressQOS:        model.EgressQoS.ValueInt64(),
-		WANEgressQOSEnabled: model.EgressQoSEnabled.ValueBoolPointer(),
-		WANDHCPCos:          model.DHCPCoS.ValueInt64(),
-		WANDHCPv6Cos:        model.DHCPV6CoS.ValueInt64(),
+		Name:            model.Name.ValueString(),
+		Purpose:         "wan", // Statically set to "wan"
+		WANNetworkGroup: "WAN", // Statically set to "WAN"
+		HiddenID:        "WAN", // Statically set to "WAN"
+		WANType:         model.Type.ValueString(),
+		WANTypeV6:       model.TypeV6.ValueString(),
+	}
+
+	// QoS Settings - only set if specified
+	if !model.VlanEnabled.IsNull() && !model.VlanEnabled.IsUnknown() {
+		network.WANVLANEnabled = model.VlanEnabled.ValueBool()
+	}
+	if !model.Vlan.IsNull() && !model.Vlan.IsUnknown() {
+		network.WANVLAN = model.Vlan.ValueInt64()
+	}
+	if !model.EgressQoS.IsNull() && !model.EgressQoS.IsUnknown() {
+		network.WANEgressQOS = model.EgressQoS.ValueInt64()
+	}
+	if !model.EgressQoSEnabled.IsNull() && !model.EgressQoSEnabled.IsUnknown() {
+		network.WANEgressQOSEnabled = model.EgressQoSEnabled.ValueBoolPointer()
+	}
+	if !model.DHCPCoS.IsNull() && !model.DHCPCoS.IsUnknown() {
+		network.WANDHCPCos = model.DHCPCoS.ValueInt64()
+	}
+	if !model.DHCPV6CoS.IsNull() && !model.DHCPV6CoS.IsUnknown() {
+		network.WANDHCPv6Cos = model.DHCPV6CoS.ValueInt64()
 	}
 
 	// DNS Settings
@@ -837,7 +847,9 @@ func (r *wanResource) modelToNetwork(
 	}
 
 	// Smart Queue Settings
-	network.WANSmartQEnabled = model.SmartQEnabled.ValueBool()
+	if !model.SmartQEnabled.IsNull() && !model.SmartQEnabled.IsUnknown() {
+		network.WANSmartQEnabled = model.SmartQEnabled.ValueBool()
+	}
 	if !model.SmartQUpRate.IsNull() && !model.SmartQUpRate.IsUnknown() {
 		network.WANSmartQUpRate = model.SmartQUpRate.ValueInt64()
 	}
@@ -846,12 +858,18 @@ func (r *wanResource) modelToNetwork(
 	}
 
 	// UPnP Settings
-	network.UPnPLanEnabled = model.UPnPEnabled.ValueBool()
+	if !model.UPnPEnabled.IsNull() && !model.UPnPEnabled.IsUnknown() {
+		network.UPnPLanEnabled = model.UPnPEnabled.ValueBool()
+	}
 	if !model.UPnPWANInterface.IsNull() && !model.UPnPWANInterface.IsUnknown() {
 		network.UPnPWANInterface = model.UPnPWANInterface.ValueString()
 	}
-	network.UPnPNatPMPEnabled = model.UPnPEnabled.ValueBoolPointer()
-	network.UPnPSecureMode = model.UPnPSecureMode.ValueBoolPointer()
+	if !model.UPnPNatPMPEnabled.IsNull() && !model.UPnPNatPMPEnabled.IsUnknown() {
+		network.UPnPNatPMPEnabled = model.UPnPNatPMPEnabled.ValueBoolPointer()
+	}
+	if !model.UPnPSecureMode.IsNull() && !model.UPnPSecureMode.IsUnknown() {
+		network.UPnPSecureMode = model.UPnPSecureMode.ValueBoolPointer()
+	}
 
 	// Load Balance Settings
 	network.WANLoadBalanceType = model.LoadBalanceType.ValueString()
@@ -859,11 +877,18 @@ func (r *wanResource) modelToNetwork(
 	network.WANFailoverPriority = model.FailoverPriority.ValueInt64()
 
 	// IGMP Settings
-	network.IGMPProxyFor = model.IGMPProxyFor.ValueString()
-	network.IGMPProxyUpstream = model.IGMPProxyUpstream.ValueBool()
+	if !model.IGMPProxyFor.IsNull() && !model.IGMPProxyFor.IsUnknown() {
+		network.IGMPProxyFor = model.IGMPProxyFor.ValueString()
+	}
+	if !model.IGMPProxyUpstream.IsNull() && !model.IGMPProxyUpstream.IsUnknown() {
+		network.IGMPProxyUpstream = model.IGMPProxyUpstream.ValueBool()
+	}
 
 	// Additional Settings
-	network.ReportWANEvent = model.ReportWANEvent.ValueBool()
+	if !model.ReportWANEvent.IsNull() && !model.ReportWANEvent.IsUnknown() {
+		network.ReportWANEvent = model.ReportWANEvent.ValueBool()
+	}
+	// Enabled is always set - it's a required field
 	network.Enabled = model.Enabled.ValueBool()
 
 	// Convert DHCP options list
