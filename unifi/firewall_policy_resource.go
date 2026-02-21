@@ -3,6 +3,7 @@ package unifi
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
@@ -48,6 +49,7 @@ type firewallPolicyResourceModel struct {
 	IPVersion           types.String `tfsdk:"ip_version"`
 	Protocol            types.String `tfsdk:"protocol"`
 	ConnectionStateType types.String `tfsdk:"connection_state_type"`
+	CreateAllowRespond  types.Bool   `tfsdk:"create_allow_respond"`
 	Logging             types.Bool   `tfsdk:"logging"`
 
 	Source      types.Object `tfsdk:"source"`
@@ -238,6 +240,13 @@ func (r *firewallPolicyResource) Schema(
 					stringvalidator.OneOf("ALL", "RESPOND_ONLY"),
 				},
 			},
+			"create_allow_respond": schema.BoolAttribute{
+				MarkdownDescription: "When true, automatically creates respond/return rules for ALLOW policies. " +
+					"This generates iptables rules for RELATED/ESTABLISHED return traffic.",
+				Optional: true,
+				Computed: true,
+				Default:  booldefault.StaticBool(false),
+			},
 			"logging": schema.BoolAttribute{
 				MarkdownDescription: "Whether to log matching traffic.",
 				Optional:            true,
@@ -336,6 +345,8 @@ func (r *firewallPolicyResource) Create(
 		site = r.client.Site
 	}
 
+	desiredIndex := plan.Index.ValueInt64()
+
 	// Convert model to API request
 	firewallPolicy, err := r.modelToAPIFirewallPolicy(ctx, &plan)
 	if err != nil {
@@ -355,10 +366,26 @@ func (r *firewallPolicyResource) Create(
 		return
 	}
 
-	// Set state
+	// Reorder policies in this zone pair so the new policy is at the correct position
+	sourceZoneID := apiFirewallPolicy.Source.ZoneID
+	destZoneID := apiFirewallPolicy.Destination.ZoneID
+	err = r.reorderPoliciesInZonePair(ctx, site, sourceZoneID, destZoneID, apiFirewallPolicy.ID, desiredIndex)
+	if err != nil {
+		resp.Diagnostics.AddWarning(
+			"Error Reordering Firewall Policies",
+			fmt.Sprintf("Policy was created but reordering failed: %s. The policy index may not match the desired value.", err),
+		)
+	}
+
+	// Set state from the API response
 	plan.ID = types.StringValue(apiFirewallPolicy.ID)
 	plan.Site = types.StringValue(site)
 	r.setResourceData(ctx, apiFirewallPolicy, &plan, site)
+
+	// Preserve the user's desired index in state rather than the API's
+	// auto-assigned value. The batch-reorder above ensures the actual API
+	// ordering is correct; storing the desired value prevents perpetual drift.
+	plan.Index = types.Int64Value(desiredIndex)
 
 	diags = resp.State.Set(ctx, plan)
 	resp.Diagnostics.Append(diags...)
@@ -466,6 +493,9 @@ func (r *firewallPolicyResource) Update(
 	if !plan.ConnectionStateType.IsNull() && !plan.ConnectionStateType.IsUnknown() {
 		state.ConnectionStateType = plan.ConnectionStateType
 	}
+	if !plan.CreateAllowRespond.IsNull() && !plan.CreateAllowRespond.IsUnknown() {
+		state.CreateAllowRespond = plan.CreateAllowRespond
+	}
 	if !plan.Logging.IsNull() && !plan.Logging.IsUnknown() {
 		state.Logging = plan.Logging
 	}
@@ -492,6 +522,8 @@ func (r *firewallPolicyResource) Update(
 	firewallPolicy.ID = id
 	firewallPolicy.SiteID = currentFirewallPolicy.SiteID
 
+	desiredIndex := plan.Index.ValueInt64()
+
 	apiFirewallPolicy, err := r.client.UpdateFirewallPolicy(ctx, site, firewallPolicy)
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -501,8 +533,34 @@ func (r *firewallPolicyResource) Update(
 		return
 	}
 
+	// If index changed, reorder policies in the zone pair
+	if currentFirewallPolicy.Index != desiredIndex {
+		sourceZoneID := apiFirewallPolicy.Source.ZoneID
+		destZoneID := apiFirewallPolicy.Destination.ZoneID
+		err = r.reorderPoliciesInZonePair(ctx, site, sourceZoneID, destZoneID, id, desiredIndex)
+		if err != nil {
+			resp.Diagnostics.AddWarning(
+				"Error Reordering Firewall Policies",
+				fmt.Sprintf("Policy was updated but reordering failed: %s. The policy index may not match the desired value.", err),
+			)
+		}
+
+		// Re-read the policy to get the final index after reordering
+		apiFirewallPolicy, err = r.client.GetFirewallPolicy(ctx, site, id)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Error Reading Firewall Policy After Update",
+				fmt.Sprintf("Could not read firewall policy after update: %s", err),
+			)
+			return
+		}
+	}
+
 	// Update state from API response
 	r.setResourceData(ctx, apiFirewallPolicy, &state, site)
+
+	// Preserve the user's desired index in state (same rationale as Create)
+	state.Index = types.Int64Value(desiredIndex)
 
 	diags = resp.State.Set(ctx, state)
 	resp.Diagnostics.Append(diags...)
@@ -574,6 +632,8 @@ func (r *firewallPolicyResource) modelToAPIFirewallPolicy(
 		IPVersion:           model.IPVersion.ValueString(),
 		Protocol:            model.Protocol.ValueString(),
 		ConnectionStateType: model.ConnectionStateType.ValueString(),
+		ConnectionStates:    []string{},
+		CreateAllowRespond:  model.CreateAllowRespond.ValueBool(),
 		Logging:             model.Logging.ValueBool(),
 	}
 
@@ -615,11 +675,17 @@ func (r *firewallPolicyResource) endpointModelToAPI(
 	model *firewallPolicyEndpointModel,
 ) unifi.FirewallPolicySource {
 	source := unifi.FirewallPolicySource{
-		ZoneID:             model.ZoneID.ValueString(),
-		MatchingTarget:     model.MatchingTarget.ValueString(),
-		MatchingTargetType: model.MatchingTargetType.ValueString(),
-		PortMatchingType:   model.PortMatchingType.ValueString(),
-		PortGroupID:        model.PortGroupID.ValueString(),
+		ZoneID:           model.ZoneID.ValueString(),
+		MatchingTarget:   model.MatchingTarget.ValueString(),
+		PortMatchingType: model.PortMatchingType.ValueString(),
+		PortGroupID:      model.PortGroupID.ValueString(),
+	}
+
+	// The UDM API rejects "ANY" for matching_target_type — only SPECIFIC and
+	// OBJECT are valid enum values. Omit the field entirely when the value is
+	// "ANY" (the schema default) so omitempty excludes it from the JSON payload.
+	if mtt := model.MatchingTargetType.ValueString(); mtt != "" && mtt != "ANY" {
+		source.MatchingTargetType = mtt
 	}
 
 	if !model.Port.IsNull() && !model.Port.IsUnknown() {
@@ -646,11 +712,15 @@ func (r *firewallPolicyResource) endpointModelToAPIDestination(
 	model *firewallPolicyEndpointModel,
 ) unifi.FirewallPolicyDestination {
 	dest := unifi.FirewallPolicyDestination{
-		ZoneID:             model.ZoneID.ValueString(),
-		MatchingTarget:     model.MatchingTarget.ValueString(),
-		MatchingTargetType: model.MatchingTargetType.ValueString(),
-		PortMatchingType:   model.PortMatchingType.ValueString(),
-		PortGroupID:        model.PortGroupID.ValueString(),
+		ZoneID:           model.ZoneID.ValueString(),
+		MatchingTarget:   model.MatchingTarget.ValueString(),
+		PortMatchingType: model.PortMatchingType.ValueString(),
+		PortGroupID:      model.PortGroupID.ValueString(),
+	}
+
+	// Same as source — never send "ANY" for matching_target_type.
+	if mtt := model.MatchingTargetType.ValueString(); mtt != "" && mtt != "ANY" {
+		dest.MatchingTargetType = mtt
 	}
 
 	if !model.Port.IsNull() && !model.Port.IsUnknown() {
@@ -704,6 +774,7 @@ func (r *firewallPolicyResource) setResourceData(
 	model.Enabled = types.BoolValue(policy.Enabled)
 	model.Index = types.Int64Value(policy.Index)
 	model.Action = types.StringValue(policy.Action)
+	model.CreateAllowRespond = types.BoolValue(policy.CreateAllowRespond)
 	model.Logging = types.BoolValue(policy.Logging)
 
 	if policy.Description == "" {
@@ -925,4 +996,109 @@ func (r *firewallPolicyResource) apiScheduleToModel(
 
 	obj, _ := types.ObjectValue(firewallPolicyScheduleAttrTypes, attrs)
 	return obj
+}
+
+// afterPredefinedThreshold is the index boundary between "before predefined"
+// and "after predefined" placement in the batch-reorder API. The UDM assigns:
+//   - before_predefined_ids → indices 10000, 10001, …
+//   - predefined (auto-generated return rules) → indices 30000, 30001, …
+//   - after_predefined_ids → indices 40000, 40001, …
+//
+// Policies with a desired index < this threshold are placed before predefined
+// rules; policies >= this threshold are placed after. This is critical for
+// BLOCK catch-all policies that must not block return traffic from ALLOW rules
+// that use create_allow_respond = true.
+const afterPredefinedThreshold int64 = 20000
+
+// reorderPoliciesInZonePair fetches all non-predefined policies in the given
+// zone pair, splits them into before-predefined and after-predefined groups
+// based on their index, inserts/moves the target policy into the correct group
+// based on desiredIndex, and calls the batch-reorder API.
+func (r *firewallPolicyResource) reorderPoliciesInZonePair(
+	ctx context.Context,
+	site, sourceZoneID, destZoneID, targetID string,
+	desiredIndex int64,
+) error {
+	allPolicies, err := r.client.ListFirewallPolicy(ctx, site)
+	if err != nil {
+		return fmt.Errorf("listing policies for reorder: %w", err)
+	}
+
+	// Collect non-predefined policies in this zone pair, excluding the target.
+	type policyRef struct {
+		id    string
+		index int64
+	}
+	var beforeOthers, afterOthers []policyRef
+	for _, p := range allPolicies {
+		if p.Predefined {
+			continue
+		}
+		if p.Source.ZoneID != sourceZoneID || p.Destination.ZoneID != destZoneID {
+			continue
+		}
+		if p.ID == targetID {
+			continue
+		}
+		if p.Index < afterPredefinedThreshold {
+			beforeOthers = append(beforeOthers, policyRef{id: p.ID, index: p.Index})
+		} else {
+			afterOthers = append(afterOthers, policyRef{id: p.ID, index: p.Index})
+		}
+	}
+
+	// Helper to sort a group and insert the target at the correct position.
+	insertTarget := func(others []policyRef, targetIdx int64) []string {
+		sort.Slice(others, func(i, j int) bool {
+			return others[i].index < others[j].index
+		})
+		ordered := make([]string, 0, len(others)+1)
+		inserted := false
+		for _, p := range others {
+			if !inserted && targetIdx <= p.index {
+				ordered = append(ordered, targetID)
+				inserted = true
+			}
+			ordered = append(ordered, p.id)
+		}
+		if !inserted {
+			ordered = append(ordered, targetID)
+		}
+		return ordered
+	}
+
+	// Helper to collect IDs in index order (no insertion).
+	collectIDs := func(others []policyRef) []string {
+		sort.Slice(others, func(i, j int) bool {
+			return others[i].index < others[j].index
+		})
+		ids := make([]string, len(others))
+		for i, p := range others {
+			ids[i] = p.id
+		}
+		return ids
+	}
+
+	var beforeIDs, afterIDs []string
+	if desiredIndex < afterPredefinedThreshold {
+		// Target goes before predefined rules
+		beforeIDs = insertTarget(beforeOthers, desiredIndex)
+		afterIDs = collectIDs(afterOthers)
+	} else {
+		// Target goes after predefined rules
+		beforeIDs = collectIDs(beforeOthers)
+		afterIDs = insertTarget(afterOthers, desiredIndex)
+	}
+
+	_, err = r.client.BatchReorderFirewallPolicies(ctx, site, &unifi.FirewallPolicyBatchReorderRequest{
+		BeforePredefinedIDs: beforeIDs,
+		AfterPredefinedIDs:  afterIDs,
+		SourceZoneID:        sourceZoneID,
+		DestinationZoneID:   destZoneID,
+	})
+	if err != nil {
+		return fmt.Errorf("batch reorder: %w", err)
+	}
+
+	return nil
 }
