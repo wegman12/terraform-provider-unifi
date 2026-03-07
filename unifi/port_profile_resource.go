@@ -72,7 +72,7 @@ type portProfileResourceModel struct {
 	StormctrlUcastRate         types.Int64  `tfsdk:"stormctrl_ucast_rate"`
 	STPPortMode                types.Bool   `tfsdk:"stp_port_mode"`
 	QOSProfileMode             types.String `tfsdk:"qos_profile_mode"`
-	TaggedNetworkConfIDs       types.Set    `tfsdk:"tagged_networkconf_ids"`
+	ExcludedNetworkConfIDs     types.Set    `tfsdk:"excluded_networkconf_ids"`
 	VoiceNetworkConfID         types.String `tfsdk:"voice_networkconf_id"`
 }
 
@@ -347,8 +347,8 @@ func (r *portProfileResource) Schema(
 				Optional:    true,
 				Computed:    true,
 			},
-			"tagged_networkconf_ids": schema.SetAttribute{
-				Description: "The IDs of networks to tag traffic with for the port profile.",
+			"excluded_networkconf_ids": schema.SetAttribute{
+				Description: "The IDs of networks to exclude from the port profile when forward is set to 'customize'.",
 				Optional:    true,
 				ElementType: types.StringType,
 			},
@@ -656,7 +656,14 @@ func (r *portProfileResource) modelToAPIPortProfile(
 		portProfile.Speed = model.Speed.ValueInt64()
 	}
 
-	// Convert tagged network IDs - skip for now as field name is unclear
+	// Convert excluded network IDs
+	if !model.ExcludedNetworkConfIDs.IsNull() && !model.ExcludedNetworkConfIDs.IsUnknown() {
+		var excludedIDs []string
+		diags.Append(model.ExcludedNetworkConfIDs.ElementsAs(ctx, &excludedIDs, false)...)
+		if !diags.HasError() {
+			portProfile.ExcludedNetworkIDs = excludedIDs
+		}
+	}
 
 	// Set STP port mode
 	if !model.STPPortMode.IsNull() && !model.STPPortMode.IsUnknown() {
@@ -765,8 +772,17 @@ func (r *portProfileResource) setResourceData(
 		model.Speed = types.Int64Null()
 	}
 
-	// Convert tagged network IDs - skip for now
-	model.TaggedNetworkConfIDs = types.SetNull(types.StringType)
+	// Convert excluded network IDs
+	if len(portProfile.ExcludedNetworkIDs) == 0 {
+		model.ExcludedNetworkConfIDs = types.SetNull(types.StringType)
+	} else {
+		excludedIDList := make([]types.String, len(portProfile.ExcludedNetworkIDs))
+		for i, id := range portProfile.ExcludedNetworkIDs {
+			excludedIDList[i] = types.StringValue(id)
+		}
+		excludedIDSet, _ := types.SetValueFrom(ctx, types.StringType, excludedIDList)
+		model.ExcludedNetworkConfIDs = excludedIDSet
+	}
 
 	model.VoiceNetworkConfID = types.StringNull() // Skip for now
 
@@ -859,8 +875,8 @@ func (r *portProfileResource) applyPlanToState(
 	if !plan.Speed.IsNull() && !plan.Speed.IsUnknown() {
 		state.Speed = plan.Speed
 	}
-	if !plan.TaggedNetworkConfIDs.IsNull() && !plan.TaggedNetworkConfIDs.IsUnknown() {
-		state.TaggedNetworkConfIDs = plan.TaggedNetworkConfIDs
+	if !plan.ExcludedNetworkConfIDs.IsNull() && !plan.ExcludedNetworkConfIDs.IsUnknown() {
+		state.ExcludedNetworkConfIDs = plan.ExcludedNetworkConfIDs
 	}
 	if !plan.VoiceNetworkConfID.IsNull() && !plan.VoiceNetworkConfID.IsUnknown() {
 		state.VoiceNetworkConfID = plan.VoiceNetworkConfID

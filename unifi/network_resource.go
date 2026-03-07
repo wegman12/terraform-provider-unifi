@@ -82,6 +82,7 @@ type networkResourceModel struct {
 
 	// IPv6 Settings
 	IPv6InterfaceType       types.String `tfsdk:"ipv6_interface_type"`
+	IPv6PDInterface         types.String `tfsdk:"ipv6_pd_interface"`
 	IPv6PDPrefixid          types.String `tfsdk:"ipv6_pd_prefixid"`
 	IPv6PDStart             types.String `tfsdk:"ipv6_pd_start"`
 	IPv6PDStop              types.String `tfsdk:"ipv6_pd_stop"`
@@ -315,6 +316,14 @@ func (r *networkResource) Schema(
 						regexp.MustCompile("^(none|pd|static)$"),
 						"invalid IPv6 interface type",
 					),
+				},
+			},
+			"ipv6_pd_interface": schema.StringAttribute{
+				MarkdownDescription: "Specifies which WAN interface to use for IPv6 Prefix Delegation. Must be one of either `wan` or `wan2`.",
+				Optional:            true,
+				Computed:            true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
 			"ipv6_pd_prefixid": schema.StringAttribute{
@@ -814,6 +823,9 @@ func (r *networkResource) applyPlanToState(
 	if !plan.IPv6InterfaceType.IsNull() && !plan.IPv6InterfaceType.IsUnknown() {
 		state.IPv6InterfaceType = plan.IPv6InterfaceType
 	}
+	if !plan.IPv6PDInterface.IsNull() && !plan.IPv6PDInterface.IsUnknown() {
+		state.IPv6PDInterface = plan.IPv6PDInterface
+	}
 	if !plan.IPv6PDPrefixid.IsNull() && !plan.IPv6PDPrefixid.IsUnknown() {
 		state.IPv6PDPrefixid = plan.IPv6PDPrefixid
 	}
@@ -1102,6 +1114,9 @@ func (r *networkResource) modelToNetwork(
 	if !model.IPv6InterfaceType.IsNull() {
 		network.IPV6InterfaceType = model.IPv6InterfaceType.ValueString()
 	}
+	if !model.IPv6PDInterface.IsNull() {
+		network.IPV6PDInterface = model.IPv6PDInterface.ValueString()
+	}
 	if !model.IPv6PDPrefixid.IsNull() {
 		network.IPV6PDPrefixid = model.IPv6PDPrefixid.ValueString()
 	}
@@ -1282,6 +1297,12 @@ func (r *networkResource) networkToModel(
 		model.IPv6InterfaceType = types.StringValue(network.IPV6InterfaceType)
 	} else {
 		model.IPv6InterfaceType = types.StringNull()
+	}
+
+	if network.IPV6PDInterface != "" {
+		model.IPv6PDInterface = types.StringValue(network.IPV6PDInterface)
+	} else {
+		model.IPv6PDInterface = types.StringNull()
 	}
 
 	if network.IPV6PDPrefixid != "" {
