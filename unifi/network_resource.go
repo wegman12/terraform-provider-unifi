@@ -585,6 +585,11 @@ func (r *networkResource) Create(
 		site = r.client.Site
 	}
 
+	// Enabled is not in the schema (updates preserve the controller's
+	// pause/unpause state), so without this the zero value creates every
+	// network paused: no bridge, no DHCP.
+	network.Enabled = true
+
 	// Create the network
 	createdNetwork, err := r.client.CreateNetwork(ctx, site, network)
 	if err != nil {
